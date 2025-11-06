@@ -1,4 +1,3 @@
-// seed-scripts/04-create-app-topics.js
 import { Kafka } from 'kafkajs';
 
 const kafka = new Kafka({
@@ -16,7 +15,7 @@ const run = async () => {
     topics: [
       {
         topic: 'inventory.stock',
-        numPartitions: 1, // Compacted topic มักใช้ 1 partition
+        numPartitions: 1, 
         replicationFactor: 1,
         configEntries: [
           { name: 'cleanup.policy', value: 'compact' }, // <--- สำคัญ

@@ -12,9 +12,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@kafkajs/confluent-schema-registry": "^3.9.0",
     "kafkajs": "^2.2.4"
   },
   "devDependencies": {
-  "nodemon": "^3.1.10"
+    "nodemon": "^3.1.10"
   }
 }

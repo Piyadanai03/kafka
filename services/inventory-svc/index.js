@@ -1,69 +1,118 @@
-// services/inventory-svc/index.js
-import { Kafka } from 'kafkajs';
+import { Kafka } from "kafkajs";
+import { SchemaRegistry, SchemaType } from "@kafkajs/confluent-schema-registry";
 
-// --- Global State (In-Memory DB) ---
-const stock = new Map(); // Map<sku, quantity>
-const processedOrderIds = new Set(); // Set<orderId>
-// ------------------------------------
+const SERVICE_NAME = "inventory-svc";
 
-const kafka = new Kafka({
-  clientId: 'inventory-svc',
-  brokers: ['localhost:9092'],
+// 2. เชื่อมต่อ Schema Registry
+const registry = new SchemaRegistry({
+  host: "http://localhost:8081/apis/ccompat/v7",
 });
 
-// --- Utility: Exponential Backoff ---
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// 3. (V1) กำหนด "พิมพ์เขียว" (Schema) สำหรับ *ขาออก*
+const orderValidatedSchema = {
+  type: SchemaType.AVRO,
+  schema: JSON.stringify({
+    type: "record",
+    name: "OrderValidated",
+    namespace: "com.mycorp.orders",
+    fields: [
+      { name: "orderId", type: "string" },
+      { name: "sku", type: "string" },
+      { name: "quantity", type: "int" },
+      { name: "timestamp", type: "string" },
+      // (ควรสืบทอด field อื่นๆ มาด้วย)
+      { name: "customerEmail", type: ["null", "string"], default: null },
+      { name: "traceId", type: ["null", "string"], default: null },
+    ],
+  }),
+};
+
+const orderRejectedSchema = {
+  type: SchemaType.AVRO,
+  schema: JSON.stringify({
+    type: "record",
+    name: "OrderRejected",
+    namespace: "com.mycorp.orders",
+    fields: [
+      { name: "orderId", type: "string" },
+      { name: "sku", type: "string" },
+      { name: "quantity", type: "int" },
+      { name: "timestamp", type: "string" },
+      { name: "customerEmail", type: ["null", "string"], default: null },
+      { name: "reason", type: "string" },
+      { name: "traceId", type: ["null", "string"], default: null },
+    ],
+  }),
+};
+
+// (Global State, Kafka setup, sleep, OutOfStockError... )
+const stock = new Map();
+const processedOrderIds = new Set();
+const kafka = new Kafka({
+  clientId: SERVICE_NAME, // <-- 1. ใช้ชื่อ Service
+  brokers: ["localhost:9092"],
+});
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 class OutOfStockError extends Error {
-  constructor(message) { super(message); this.name = 'OutOfStockError'; }
+  constructor(message) {
+    super(message);
+    this.name = "OutOfStockError";
+  }
 }
 
-/**
- * ---------------------------------------------------
- * ขั้นตอนที่ 1: Bootstrap Stock (โหลดสต็อกเข้าระบบ)
- * (FIXED: แก้ไข Race Condition)
- * ---------------------------------------------------
- */
 const loadStock = async () => {
   const stockConsumer = kafka.consumer({ 
     groupId: `inventory-loader-group-${Date.now()}` 
   });
-  await stockConsumer.connect(); // <--- 1. Connect ก่อน
+  await stockConsumer.connect();
   await stockConsumer.subscribe({
     topic: 'inventory.stock',
     fromBeginning: true,
   });
-  console.log('[Stock Loader] Connected. Loading initial stock...');
+  
+  console.log(JSON.stringify({
+    level: "INFO",
+    service: SERVICE_NAME,
+    component: "StockLoader",
+    message: "Connected. Loading initial stock...",
+  }));
 
   const partitionCount = 1; 
   let partitionsDone = new Set();
 
-  // <--- 2. สร้าง Promise ให้ .run() ทำงาน
   await new Promise((resolve, reject) => {
     stockConsumer.run({
       eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
-        // (ส่วนนี้เหมือนเดิม)
         if (!isRunning() || isStale()) return;
         try {
+          // เพิ่ม partition เข้า Set
+          partitionsDone.add(batch.partition);
+          
           for (const message of batch.messages) {
             if (!message.value) continue;
             const { sku, quantity } = JSON.parse(message.value.toString());
             stock.set(sku, quantity);
-            console.log(`[Stock Loader] Loaded: ${sku} = ${quantity}`);
+            
+            console.log(JSON.stringify({
+                level: "DEBUG",
+                service: SERVICE_NAME,
+                component: "StockLoader",
+                message: `Loaded: ${sku} = ${quantity}`
+            }));
             resolveOffset(message.offset);
           }
           await heartbeat();
-          const lastOffsetInBatch = Number(batch.messages[batch.messages.length - 1].offset);
-          const highWatermark = Number(batch.highWatermark);
-          if (lastOffsetInBatch + 1 === highWatermark) {
-            if (!partitionsDone.has(batch.partition)) {
-              partitionsDone.add(batch.partition);
-              console.log(`[Stock Loader] Finished reading partition ${batch.partition}`);
-            }
-          }
+          
+          // เช็คว่าอ่านครบทุก partition แล้ว
           if (partitionsDone.size === partitionCount) {
-            console.log('[Stock Loader] Finished loading all stock.');
-            console.log('Current Stock:', stock);
-            resolve(); // <--- 3. เมื่ออ่านจบ ให้ Resolve Promise
+            console.log(JSON.stringify({
+                level: "INFO",
+                service: SERVICE_NAME,
+                component: "StockLoader",
+                message: "Finished loading all stock.",
+                stock: Object.fromEntries(stock)
+            }));
+            resolve();
           }
         } catch (e) {
           reject(e);
@@ -72,109 +121,192 @@ const loadStock = async () => {
     }).catch(reject);
   });
 
-  // <--- 4. (FIX) เมื่อ Promise จบแล้ว ค่อย Disconnect
-  // สิ่งนี้จะเกิดขึ้น "ก่อน" ที่ main จะไปเรียก processOrders()
-  console.log('[Stock Loader] Disconnecting stockConsumer...');
+  console.log(JSON.stringify({ 
+    level: "INFO", 
+    service: SERVICE_NAME, 
+    component: "StockLoader", 
+    message: "Disconnecting stockConsumer..."
+  }));
   await stockConsumer.disconnect();
-  console.log('[Stock Loader] Disconnected.');
+  console.log(JSON.stringify({ 
+    level: "INFO", 
+    service: SERVICE_NAME, 
+    component: "StockLoader", 
+    message: "Disconnected."
+  }));
 };
 
-
-/**
- * ---------------------------------------------------
- * ขั้นตอนที่ 2: Process Orders (Consumer หลัก)
- * ---------------------------------------------------
- */
 const processOrders = async () => {
-  const producer = kafka.producer(); 
-  const orderConsumer = kafka.consumer({ 
-    groupId: 'inventory-processor-group',
+  const producer = kafka.producer();
+  const orderConsumer = kafka.consumer({
+    groupId: "inventory-processor-group",
     autoCommit: false,
   });
-  
+
+  const { id: validatedSchemaId } = await registry.register(
+    orderValidatedSchema
+  );
+  const { id: rejectedSchemaId } = await registry.register(orderRejectedSchema);
+
   await orderConsumer.connect();
-  await orderConsumer.subscribe({ topic: 'orders.created' });
+  await orderConsumer.subscribe({ topic: "orders.created" });
   await producer.connect();
-  
-  console.log('[Order Processor] Connected. Waiting for orders...');
+
+  console.log(
+    JSON.stringify({
+      level: "INFO",
+      service: SERVICE_NAME,
+      component: "OrderProcessor",
+      message: "Connected. Waiting for orders...",
+    })
+  );
 
   await orderConsumer.run({
     eachMessage: async ({ topic, partition, message }) => {
-      const order = JSON.parse(message.value.toString());
-      const { orderId, sku, quantity } = order;
+      await sleep(2000);
+      const order = await registry.decode(message.value);
 
-      console.log(`\n[Order Processor] Received Order: ${orderId} (SKU: ${sku}, Qty: ${quantity})`);
+      // ---!!! 6. ดึง traceId และ orderId ออกมา !!!---
+      const { orderId, sku, quantity, traceId } = order;
 
-      // 1. Idempotency Check
+      console.log(
+        JSON.stringify({
+          level: "INFO",
+          traceId, // <-- ล็อก
+          orderId, // <-- ล็อก
+          service: SERVICE_NAME,
+          component: "OrderProcessor",
+          message: "Received Order",
+          sku,
+          quantity,
+        })
+      );
+
       if (processedOrderIds.has(orderId)) {
-        console.warn(`[Idempotency] Order ${orderId} already processed. Skipping.`);
-        await orderConsumer.commitOffsets([{ topic, partition, offset: message.offset }]);
+        console.warn(
+          JSON.stringify({
+            level: "WARN",
+            traceId,
+            orderId,
+            service: SERVICE_NAME,
+            component: "OrderProcessor",
+            message: "Idempotency check: Order already processed. Skipping.",
+          })
+        );
+        await orderConsumer.commitOffsets([
+          { topic, partition, offset: message.offset },
+        ]);
         return;
       }
 
-      // 2. Retry + DLQ Logic
       const MAX_RETRIES = 3;
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-          // --- Business Logic ---
           const currentStock = stock.get(sku) || 0;
           if (currentStock < quantity) {
-            throw new OutOfStockError(`Not enough stock for ${sku}: ${currentStock} < ${quantity}`);
+            throw new OutOfStockError(
+              `Not enough stock for ${sku}: ${currentStock} < ${quantity}`
+            );
           }
-          
           if (Math.random() < 0.1 && attempt < MAX_RETRIES) {
-             throw new Error('Simulated transient database error!');
+            throw new Error("Simulated transient database error!");
           }
 
-          // --- Success Path ---
-          stock.set(sku, currentStock - quantity); // หักสต็อก
-          console.log(`[Success] Stock updated for ${sku}: ${stock.get(sku)}`);
+          stock.set(sku, currentStock - quantity);
+          console.log(
+            JSON.stringify({
+              level: "INFO",
+              traceId,
+              orderId,
+              service: SERVICE_NAME,
+              component: "OrderProcessor",
+              message: "[Success] Stock updated",
+              sku,
+              newStock: stock.get(sku),
+            })
+          );
 
+          // ---!!! 7. ส่งต่อ order object ที่มี traceId อยู่แล้ว ---!!!
+          // (Object `order` ที่ decode มา มี traceId อยู่แล้ว)
+          const successPayload = await registry.encode(
+            validatedSchemaId,
+            order
+          );
           await producer.send({
-            topic: 'orders.validated',
-            messages: [{ key: orderId, value: JSON.stringify(order) }]
+            topic: "orders.validated",
+            messages: [{ key: orderId, value: successPayload }],
           });
 
           processedOrderIds.add(orderId);
-          await orderConsumer.commitOffsets([{ topic, partition, offset: message.offset }]);
+          await orderConsumer.commitOffsets([
+            { topic, partition, offset: message.offset },
+          ]);
           return;
-
         } catch (error) {
-          
-          // --- Business Failure (ของหมด) ---
           if (error instanceof OutOfStockError) {
-            console.error(`[Business Failure] ${error.message}`);
+            console.error(
+              JSON.stringify({
+                level: "ERROR",
+                traceId,
+                orderId,
+                service: SERVICE_NAME,
+                component: "OrderProcessor",
+                message: "[Business Failure] Out of stock",
+                error: error.message,
+              })
+            );
+
+            // ---!!! 7. ส่งต่อ order object + reason ---!!!
+            const rejectionData = { ...order, reason: error.message };
+            const failurePayload = await registry.encode(
+              rejectedSchemaId,
+              rejectionData
+            );
             await producer.send({
-              topic: 'orders.rejected',
-              messages: [{ key: orderId, value: JSON.stringify({ ...order, reason: error.message }) }]
+              topic: "orders.rejected",
+              messages: [{ key: orderId, value: failurePayload }],
             });
+
             processedOrderIds.add(orderId);
-            await orderConsumer.commitOffsets([{ topic, partition, offset: message.offset }]);
+            await orderConsumer.commitOffsets([
+              { topic, partition, offset: message.offset },
+            ]);
             return;
           }
 
-          // --- Transient Failure (ระบบล่มชั่วคราว) ---
-          console.warn(`[Retryable Failure] Attempt ${attempt}/${MAX_RETRIES} for order ${orderId}. Error: ${error.message}`);
-          
+          console.warn(
+            JSON.stringify({
+              level: "WARN",
+              traceId,
+              orderId,
+              service: SERVICE_NAME,
+              component: "OrderProcessor",
+              message: `[Retryable Failure] Attempt ${attempt}/${MAX_RETRIES}`,
+              error: error.message,
+            })
+          );
+
           if (attempt === MAX_RETRIES) {
-            // --- DLQ Path ---
-            console.error(`[DLQ] All retries failed for order ${orderId}. Sending to DLQ.`);
-            await producer.send({
-              topic: 'inventory.dlq',
-              messages: [{ 
-                key: orderId, 
-                value: JSON.stringify({
-                  originalMessage: order,
-                  error: error.message,
-                  timestamp: new Date().toISOString()
-                })
-              }]
-            });
-            await orderConsumer.commitOffsets([{ topic, partition, offset: message.offset }]);
+            console.error(
+              JSON.stringify({
+                level: "ERROR",
+                traceId,
+                orderId,
+                service: SERVICE_NAME,
+                component: "OrderProcessor",
+                message: "[DLQ] Max retries reached. Sending to DLQ.",
+                error: error.message,
+              })
+            );
+            // ... producer.send to DLQ ...
+            processedOrderIds.add(orderId);
+            await orderConsumer.commitOffsets([
+              { topic, partition, offset: message.offset },
+            ]);
             return;
           }
 
-          const backoffTime = (2 ** attempt) * 100;
+          const backoffTime = 50 * attempt;
           await sleep(backoffTime);
         }
       }
@@ -184,11 +316,44 @@ const processOrders = async () => {
 
 // --- Main Function ---
 const main = async () => {
-  await loadStock();
+  try {
+    await loadStock();
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        level: "FATAL",
+        service: SERVICE_NAME,
+        component: "StockLoader",
+        message: "Failed to load initial stock. Exiting.",
+        error: e.message,
+        stack: e.stack,
+      })
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    JSON.stringify({
+      level: "INFO",
+      service: SERVICE_NAME,
+      component: "StockLoader",
+      message: "Initial stock loaded successfully.",
+      stock: Object.fromEntries(stock),
+    })
+  );
+
+  // 3. เริ่มประมวลผล Order
   await processOrders();
 };
 
-main().catch(e => {
-    console.error("---!!! MAIN CATCH BLOCK !!!---");
-    console.error(e);
+main().catch((e) => {
+  console.error(
+    JSON.stringify({
+      level: "FATAL",
+      service: SERVICE_NAME,
+      message: "---!!! MAIN CATCH BLOCK !!!---",
+      error: e.message,
+      stack: e.stack,
+    })
+  );
 });

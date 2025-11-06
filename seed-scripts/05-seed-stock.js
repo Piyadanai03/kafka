@@ -21,7 +21,7 @@ const run = async () => {
   // ส่งสต็อกเริ่มต้น: SKU ละ 10 ชิ้น
   const messages = skus.map(sku => ({
     key: sku, // Key คือ SKU
-    value: JSON.stringify({ sku: sku, quantity: 10 }) // Value คือข้อมูลสต็อก
+    value: JSON.stringify({ sku: sku, quantity: 100 }) // Value คือข้อมูลสต็อก
   }));
 
   await producer.send({

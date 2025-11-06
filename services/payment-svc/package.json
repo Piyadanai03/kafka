@@ -1,5 +1,5 @@
 {
-  "name": "order-api",
+  "name": "payment-svc",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -13,7 +13,6 @@
   "license": "ISC",
   "dependencies": {
     "@kafkajs/confluent-schema-registry": "^3.9.0",
-    "express": "^5.1.0",
     "kafkajs": "^2.2.4"
   },
   "devDependencies": {

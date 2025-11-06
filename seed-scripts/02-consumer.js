@@ -6,7 +6,7 @@ const kafka = new Kafka({
 });
 
 const consumer = kafka.consumer({ 
-  groupId: 'order-checkers' // <--- Consumer Group ID สำคัญมาก
+  groupId: 'order-checkers' 
 });
 
 const run = async () => {
