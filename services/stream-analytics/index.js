@@ -3,15 +3,16 @@ import express from "express";
 import { SchemaRegistry, SchemaType } from "@kafkajs/confluent-schema-registry";
 import { randomUUID } from "crypto";
 import client from "prom-client";
+import { createClient } from "redis";
 
 const SERVICE_NAME = "analytics-svc";
 
-// 2. เชื่อมต่อ Schema Registry
+//เชื่อมต่อ Schema Registry
 const registry = new SchemaRegistry({
   host: "http://localhost:8081/apis/ccompat/v7",
 });
 
-// 3. (V1) กำหนด "พิมพ์เขียว" (Schema) สำหรับ *ขาออก*
+//กำหนด "พิมพ์เขียว" (Schema) สำหรับ *ขาออก*
 const metricsSchema = {
   type: SchemaType.AVRO,
   schema: JSON.stringify({
@@ -26,11 +27,8 @@ const metricsSchema = {
   }),
 };
 
-// (In-Memory State...)
-const skuCounts = new Map();
 let ordersInThisMinute = 0;
 
-// (Kafka Setup...)
 const kafka = new Kafka({
   clientId: SERVICE_NAME,
   brokers: ["localhost:9092"],
@@ -38,11 +36,21 @@ const kafka = new Kafka({
 const consumer = kafka.consumer({ groupId: "analytics-processor-group" });
 const producer = kafka.producer();
 
-// <<< CHANGED: -----------------------------------------------------
-// <<< CHANGED: 3. สร้าง Prometheus Metrics
-// <<< CHANGED: -----------------------------------------------------
+const redisClient = createClient({
+  url: "redis://localhost:6379",
+});
+redisClient.on("error", (err) =>
+  console.error(
+    JSON.stringify({
+      level: "ERROR",
+      service: SERVICE_NAME,
+      message: "Redis Client Error",
+      error: err,
+    })
+  )
+);
 
-// เปิดการเก็บ Metrics เริ่มต้น 
+// เปิดการเก็บ Metrics เริ่มต้น
 client.collectDefaultMetrics();
 
 // 1. Gauge (มาตรวัด) สำหรับนับ Order ในหน้าต่างปัจจุบัน (ค่าจะขึ้น/ลง และ Reset)
@@ -65,14 +73,24 @@ const skuTotalGauge = new client.Gauge({
   labelNames: ["sku"],
 });
 
-
 const app = express();
-const getTopSkus = () => {
-  const sorted = [...skuCounts.entries()].sort((a, b) => b[1] - a[1]);
+const getTopSkus = async () => {
+  const skuCountsObject = await redisClient.hGetAll("sku_counts");
+
+  if (!skuCountsObject || Object.keys(skuCountsObject).length === 0) {
+    return []; // คืนค่าว่าง ถ้ายังไม่มีข้อมูล
+  }
+
+  //แปลง Object เป็น Array 
+  const skuCountsArray = Object.entries(skuCountsObject).map(([sku, count]) => {
+    return [sku, parseInt(count, 10)]; // แปลง "10" (string) เป็น 10 (number)
+  });
+
+  const sorted = skuCountsArray.sort((a, b) => b[1] - a[1]); // b[1] คือ count
   return sorted.slice(0, 5).map((item) => ({ sku: item[0], count: item[1] }));
 };
 
-app.get("/api/dashboard", (req, res) => {
+app.get("/api/dashboard", async (req, res) => {
   const traceId = randomUUID();
   console.log(
     JSON.stringify({
@@ -85,7 +103,7 @@ app.get("/api/dashboard", (req, res) => {
   );
   res.json({
     orders_in_current_minute_window: ordersInThisMinute,
-    top_5_skus_all_time: getTopSkus(),
+    top_5_skus_all_time: await getTopSkus(),
   });
 });
 
@@ -107,7 +125,6 @@ app.get("/metrics", async (req, res) => {
   }
 });
 
-// 4. STREAMING LOGIC (CONSUMER)
 const runConsumer = async () => {
   await consumer.connect();
   await consumer.subscribe({ topic: "orders.validated", fromBeginning: false });
@@ -124,8 +141,27 @@ const runConsumer = async () => {
     eachMessage: async ({ message }) => {
       const order = await registry.decode(message.value);
       const { orderId, traceId, sku } = order;
+
+      const idempotencyKey = `processed:analytics:${orderId}`;
+      const isNew = await redisClient.set(idempotencyKey, "true", {
+        EX: 86400, // 1 day
+        NX: true,
+      });
+      if (!isNew) {
+        console.warn(
+          JSON.stringify({
+            level: "WARN",
+            traceId,
+            orderId,
+            service: SERVICE_NAME,
+            message:
+              "Idempotency check (Redis): Analytics already processed. Skipping.",
+          })
+        );
+        return; // ข้ามการนับ (Kafka จะ auto-commit offset นี้ให้)
+      }
       ordersInThisMinute++;
-      // <<< CHANGED: อัปเดต Gauge ของหน้าต่างปัจจุบัน
+
       ordersInWindowGauge.set(ordersInThisMinute);
 
       console.log(
@@ -139,13 +175,11 @@ const runConsumer = async () => {
           ordersInThisMinute,
         })
       );
-      const currentSkuCount = skuCounts.get(order.sku) || 0;
-      const newSkuCount = currentSkuCount + 1; // <<< CHANGED
-      skuCounts.set(order.sku, newSkuCount); // <<< CHANGED
 
-      // <<< CHANGED: อัปเดต Prometheus Metrics
-      ordersValidatedCounter.inc({ sku: order.sku }); // เพิ่ม Counter
-      skuTotalGauge.set({ sku: order.sku }, newSkuCount); // อัปเดต Gauge SKU
+      const newSkuCount = await redisClient.hIncrBy("sku_counts", order.sku, 1);
+
+      ordersValidatedCounter.inc({ sku: order.sku });
+      skuTotalGauge.set({ sku: order.sku }, newSkuCount);
 
       console.log(
         JSON.stringify({
@@ -163,7 +197,6 @@ const runConsumer = async () => {
   });
 };
 
-// 5. WINDOWING LOGIC (TIMER)
 const runWindowTimer = async () => {
   await producer.connect();
   const { id: metricsSchemaId } = await registry.register(metricsSchema);
@@ -198,20 +231,39 @@ const runWindowTimer = async () => {
     }); // Reset หน้าต่าง
 
     ordersInThisMinute = 0;
-    // <<< CHANGED: Reset Gauge ของ Prometheus ด้วย
+
     ordersInWindowGauge.set(0);
   }, 60000); // 1 นาที
 };
 
-// (Main Function...)
 const main = async () => {
+  try {
+    await redisClient.connect();
+    console.log(
+      JSON.stringify({
+        level: "INFO",
+        service: SERVICE_NAME,
+        message: "Redis connected.",
+      })
+    );
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: "FATAL",
+        service: SERVICE_NAME,
+        message: "Failed to connect to Redis. Exiting.",
+        error: err.message,
+      })
+    );
+    process.exit(1);
+  }
+
   app.listen(4000, () => {
     console.log(
       JSON.stringify({
         level: "INFO",
         service: SERVICE_NAME,
         component: "MetricsAPI",
-        // <<< CHANGED: อัปเดต Log message
         message:
           "Listening on http://localhost:4000. Metrics at /metrics, JSON at /api/dashboard",
       })

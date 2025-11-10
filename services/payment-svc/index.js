@@ -1,6 +1,6 @@
 import { Kafka } from "kafkajs";
 import { SchemaRegistry, SchemaType } from "@kafkajs/confluent-schema-registry";
-import { createClient } from "redis"; // <<< IMPORT REDIS
+import { createClient } from "redis";
 
 const SERVICE_NAME = "payment-svc";
 
@@ -190,6 +190,8 @@ const run = async () => {
           })
         );
 
+        // console.error("---!!! SIMULATING CRASH BEFORE COMMIT !!!---");
+        // process.exit(1);
       } catch (error) {
         const failureData = { ...order, reason: error.message };
         const payload = await registry.encode(failedSchemaId, failureData);
