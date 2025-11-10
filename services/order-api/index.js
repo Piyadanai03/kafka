@@ -1,43 +1,92 @@
 import express from "express";
-import { Kafka } from "kafkajs";
-import { randomUUID } from "crypto"; // <-- 1. Import
-import { SchemaRegistry, SchemaType } from "@kafkajs/confluent-schema-registry";
+import { Sequelize, DataTypes, Model } from "sequelize";
+import { randomUUID } from "crypto";
 
 const SERVICE_NAME = "order-api";
 
-// 2. เชื่อมต่อ Schema Registry
-const registry = new SchemaRegistry({
-  host: "http://localhost:8081/apis/ccompat/v7",
-});
+// ---!!! 1. Setup Sequelize (เชื่อมต่อ DB) !!!---
+const sequelize = new Sequelize(
+  "order_db", // Database name
+  "postgres", // User
+  "postgres", // Password
+  {
+    host: "localhost", // หรือ 'db' ถ้า service นี้รันใน Docker
+    port: 5432,
+    dialect: "postgres",
+    logging: (msg) =>
+      console.log(
+        JSON.stringify({
+          level: "DEBUG",
+          service: SERVICE_NAME,
+          component: "Sequelize",
+          message: msg,
+        })
+      ),
+  }
+);
 
-// --- Kafka Producer Setup ---
-const kafka = new Kafka({
-  clientId: SERVICE_NAME,
-  brokers: ["localhost:9092"],
-});
-const producer = kafka.producer();
+// ---!!! 2. Define Models (ต้องตรงกับตารางที่คุณสร้าง) !!!---
 
-// 3. (V2) กำหนด "พิมพ์เขียว" (Schema)
-const orderCreatedSchemaV2 = {
-  type: SchemaType.AVRO,
-  schema: JSON.stringify({
-    type: "record",
-    name: "OrderCreated",
-    namespace: "com.mycorp.orders",
-    fields: [
-      { name: "orderId", type: "string" },
-      { name: "sku", type: "string" },
-      { name: "quantity", type: "int" },
-      { name: "timestamp", type: "string" },
-      {
-        name: "customerEmail",
-        type: ["null", "string"],
-        default: null,
-      },
-      { name: 'traceId', type: ['null', 'string'], default: null }
-    ],
-  }),
-};
+class Order extends Model {}
+Order.init(
+  {
+    id: {
+      type: DataTypes.UUID,
+      primaryKey: true,
+    },
+    sku: {
+      type: DataTypes.STRING(100),
+      allowNull: false,
+    },
+    quantity: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+    },
+    customer_email: {
+      type: DataTypes.STRING(255),
+    },
+  },
+  {
+    sequelize,
+    modelName: "Order",
+    tableName: "orders", // บังคับให้ตรงกับชื่อตาราง
+    timestamps: true, // ใช้ created_at
+    updatedAt: false,
+    underscored: true,
+  }
+);
+
+class OutboxEvent extends Model {}
+OutboxEvent.init(
+  {
+    id: {
+      type: DataTypes.UUID,
+      primaryKey: true,
+    },
+    topic: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+    },
+    message_key: {
+      type: DataTypes.STRING(255),
+    },
+    payload: {
+      type: DataTypes.JSONB, // <--- สำคัญ
+      allowNull: false,
+    },
+  },
+  {
+    sequelize,
+    modelName: "OutboxEvent",
+    tableName: "outbox_events", // บังคับให้ตรงกับชื่อตาราง
+    timestamps: true, // ใช้ created_at
+    updatedAt: false,
+    underscored: true,
+  }
+);
+
+// ---!!! 3. ลบ Kafka Producer ทั้งหมด !!!---
+// (ไม่มี Kafka, ไม่มี Schema Registry ใน Service นี้อีกต่อไป)
 
 // --- Express App Setup ---
 const app = express();
@@ -45,13 +94,11 @@ app.use(express.json());
 
 // --- Endpoint: POST /orders ---
 app.post("/orders", async (req, res) => {
-  // ---!!! 5. สร้าง traceId และตัวแปรสำหรับ Log !!!---
   const traceId = randomUUID();
   const service = SERVICE_NAME;
 
   const { sku, quantity } = req.body;
   if (!sku || !quantity) {
-    // ---!!! 6. เปลี่ยน Log เป็น Structured Log !!!---
     console.warn(
       JSON.stringify({
         level: "WARN",
@@ -64,49 +111,70 @@ app.post("/orders", async (req, res) => {
   }
 
   const orderId = randomUUID();
-  const order = {
+  const orderData = {
     orderId: orderId,
     sku: sku,
     quantity: parseInt(quantity, 10),
     timestamp: new Date().toISOString(),
     customerEmail: "example@customer.com",
-    traceId: traceId, 
+    traceId: traceId,
   };
 
+  // ---!!! 4. ใช้ Database Transaction !!!---
   try {
-    const { id } = await registry.register(orderCreatedSchemaV2);
-    const payload = await registry.encode(id, order);
+    // 4.1. เริ่ม Transaction
+    await sequelize.transaction(async (t) => {
+      // 4.2. สร้าง Order (INSERT ลงตาราง 'orders')
+      await Order.create(
+        {
+          id: orderData.orderId,
+          sku: orderData.sku,
+          quantity: orderData.quantity,
+          customer_email: orderData.customerEmail,
+        },
+        { transaction: t }
+      );
 
-    await producer.send({
-      topic: "orders.created",
-      messages: [{ key: orderId, value: payload }],
+      // 4.3. สร้าง Event (INSERT ลงตาราง 'outbox_events')
+      await OutboxEvent.create(
+        {
+          id: randomUUID(),
+          topic: "orders.created", // <--- Topic ที่ Debezium จะอ่าน
+          message_key: orderData.orderId, // <--- Key ของ Message
+          payload: orderData, // <--- Payload ทั้งหมดของ Message
+        },
+        { transaction: t }
+      );
+
+      // 4.4. ถ้าถึงบรรทัดนี้ได้ -> Sequelize จะ Commit ให้อัตโนมัติ
     });
 
-    // ---!!! 6. เปลี่ยน Log เป็น Structured Log !!!---
+    // 4.5. Transaction สำเร็จ! (Commit เรียบร้อย)
     console.log(
       JSON.stringify({
         level: "INFO",
         traceId,
         orderId,
         service,
-        message: "Order produced",
-        schemaId: id,
+        message: "Order saved to DB and Outbox event created.",
       })
     );
 
+    // ตอบกลับ Client ทันที
     res.status(202).json({
       message: "Order received, processing...",
       orderId: orderId,
     });
   } catch (error) {
-    // ---!!! 6. เปลี่ยน Log เป็น Structured Log !!!---
+    // 4.6. ถ้าเกิด Error -> Sequelize จะ Rollback ให้อัตโนมัติ
+    // (ทั้ง 'orders' และ 'outbox_events' จะถูกย้อนกลับ)
     console.error(
       JSON.stringify({
         level: "ERROR",
         traceId,
-        orderId, // อาจจะยังไม่มี
+        orderId,
         service,
-        message: "Error producing order",
+        message: "Error processing order (Transaction Rolled Back)",
         error: error.message,
         stack: error.stack,
       })
@@ -117,27 +185,37 @@ app.post("/orders", async (req, res) => {
 
 // --- Run Server ---
 const run = async () => {
-  await producer.connect();
-  app.listen(3000, () => {
-    // ---!!! 6. เปลี่ยน Log เป็น Structured Log !!!---
+  try {
+    await sequelize.authenticate(); // ลองเชื่อมต่อ DB
     console.log(
       JSON.stringify({
         level: "INFO",
         service: SERVICE_NAME,
-        message: "Order API listening on port 3000",
+        message: "PostgreSQL Database connected.",
       })
     );
-  });
+
+    app.listen(3000, () => {
+      console.log(
+        JSON.stringify({
+          level: "INFO",
+          service: SERVICE_NAME,
+          message: "Order API listening on port 3000",
+        })
+      );
+    });
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        level: "FATAL",
+        service: SERVICE_NAME,
+        message: "Failed to run server or connect to DB",
+        error: e.message,
+        stack: e.stack,
+      })
+    );
+    process.exit(1); // ออกจากโปรแกรมทันทีถ้าต่อ DB ไม่ได้
+  }
 };
 
-run().catch((e) =>
-  console.error(
-    JSON.stringify({
-      level: "FATAL",
-      service: SERVICE_NAME,
-      message: "Failed to run server",
-      error: e.message,
-      stack: e.stack,
-    })
-  )
-);
+run();

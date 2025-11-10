@@ -31,7 +31,39 @@ services:
     image: redis:latest
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
       
+  db:
+    image: debezium/postgres:15
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=order_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  connect:
+    image: debezium/connect:2.6
+    ports:
+      - "8083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=redpanda:9093
+      - GROUP_ID=debezium-connect-group
+      - CONFIG_STORAGE_TOPIC=debezium_configs
+      - OFFSET_STORAGE_TOPIC=debezium_offsets
+      - STATUS_STORAGE_TOPIC=debezium_status
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_INTERNAL_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_INTERNAL_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
+    depends_on: [redpanda, db]
+
   prometheus:
     image: prom/prometheus:latest
     ports:
@@ -49,4 +81,11 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
     depends_on: [prometheus]
+
+volumes:
+  postgres-data:
+  redis-data:
+  grafana-data:
