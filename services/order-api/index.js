@@ -1,92 +1,8 @@
 import express from "express";
-import { Sequelize, DataTypes, Model } from "sequelize";
 import { randomUUID } from "crypto";
-
-const SERVICE_NAME = "order-api";
-
-// ---!!! 1. Setup Sequelize (เชื่อมต่อ DB) !!!---
-const sequelize = new Sequelize(
-  "order_db", // Database name
-  "postgres", // User
-  "postgres", // Password
-  {
-    host: "localhost", // หรือ 'db' ถ้า service นี้รันใน Docker
-    port: 5432,
-    dialect: "postgres",
-    logging: (msg) =>
-      console.log(
-        JSON.stringify({
-          level: "DEBUG",
-          service: SERVICE_NAME,
-          component: "Sequelize",
-          message: msg,
-        })
-      ),
-  }
-);
-
-// ---!!! 2. Define Models (ต้องตรงกับตารางที่คุณสร้าง) !!!---
-
-class Order extends Model {}
-Order.init(
-  {
-    id: {
-      type: DataTypes.UUID,
-      primaryKey: true,
-    },
-    sku: {
-      type: DataTypes.STRING(100),
-      allowNull: false,
-    },
-    quantity: {
-      type: DataTypes.INTEGER,
-      allowNull: false,
-    },
-    customer_email: {
-      type: DataTypes.STRING(255),
-    },
-  },
-  {
-    sequelize,
-    modelName: "Order",
-    tableName: "orders", // บังคับให้ตรงกับชื่อตาราง
-    timestamps: true, // ใช้ created_at
-    updatedAt: false,
-    underscored: true,
-  }
-);
-
-class OutboxEvent extends Model {}
-OutboxEvent.init(
-  {
-    id: {
-      type: DataTypes.UUID,
-      primaryKey: true,
-    },
-    topic: {
-      type: DataTypes.STRING(255),
-      allowNull: false,
-    },
-    message_key: {
-      type: DataTypes.STRING(255),
-    },
-    payload: {
-      type: DataTypes.JSONB, // <--- สำคัญ
-      allowNull: false,
-    },
-  },
-  {
-    sequelize,
-    modelName: "OutboxEvent",
-    tableName: "outbox_events", // บังคับให้ตรงกับชื่อตาราง
-    timestamps: true, // ใช้ created_at
-    updatedAt: false,
-    underscored: true,
-  }
-);
-
-// ---!!! 3. ลบ Kafka Producer ทั้งหมด !!!---
-// (ไม่มี Kafka, ไม่มี Schema Registry ใน Service นี้อีกต่อไป)
+import { Order, OutboxEvent } from "./model/models.js";
+import { sequelize } from "./db/connectDB.js";
+import { SERVICE_NAME } from "./db/connectDB.js";
 
 // --- Express App Setup ---
 const app = express();
@@ -120,11 +36,11 @@ app.post("/orders", async (req, res) => {
     traceId: traceId,
   };
 
-  // ---!!! 4. ใช้ Database Transaction !!!---
+  // ใช้ Database Transaction !!!---
   try {
-    // 4.1. เริ่ม Transaction
+    // เริ่ม Transaction
     await sequelize.transaction(async (t) => {
-      // 4.2. สร้าง Order (INSERT ลงตาราง 'orders')
+      // สร้าง Order (INSERT ลงตาราง 'orders')
       await Order.create(
         {
           id: orderData.orderId,
@@ -135,21 +51,21 @@ app.post("/orders", async (req, res) => {
         { transaction: t }
       );
 
-      // 4.3. สร้าง Event (INSERT ลงตาราง 'outbox_events')
+      //สร้าง Event (INSERT ลงตาราง 'outbox_events')
       await OutboxEvent.create(
         {
           id: randomUUID(),
-          topic: "orders.created", // <--- Topic ที่ Debezium จะอ่าน
-          message_key: orderData.orderId, // <--- Key ของ Message
-          payload: orderData, // <--- Payload ทั้งหมดของ Message
+          topic: "orders.created", 
+          message_key: orderData.orderId, 
+          payload: orderData, 
         },
         { transaction: t }
       );
 
-      // 4.4. ถ้าถึงบรรทัดนี้ได้ -> Sequelize จะ Commit ให้อัตโนมัติ
+      //ถ้าถึงบรรทัดนี้ได้ -> Sequelize จะ Commit ให้อัตโนมัติ
     });
 
-    // 4.5. Transaction สำเร็จ! (Commit เรียบร้อย)
+    //Transaction สำเร็จ! (Commit เรียบร้อย)
     console.log(
       JSON.stringify({
         level: "INFO",
@@ -166,7 +82,7 @@ app.post("/orders", async (req, res) => {
       orderId: orderId,
     });
   } catch (error) {
-    // 4.6. ถ้าเกิด Error -> Sequelize จะ Rollback ให้อัตโนมัติ
+    // ถ้าเกิด Error -> Sequelize จะ Rollback ให้อัตโนมัติ
     // (ทั้ง 'orders' และ 'outbox_events' จะถูกย้อนกลับ)
     console.error(
       JSON.stringify({
@@ -186,7 +102,7 @@ app.post("/orders", async (req, res) => {
 // --- Run Server ---
 const run = async () => {
   try {
-    await sequelize.authenticate(); // ลองเชื่อมต่อ DB
+    await sequelize.authenticate();
     console.log(
       JSON.stringify({
         level: "INFO",
