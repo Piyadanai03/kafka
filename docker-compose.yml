@@ -47,7 +47,9 @@ services:
       - postgres-data:/var/lib/postgresql/data
 
   connect:
-    image: debezium/connect:2.6
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8083:8083"
     environment:
@@ -62,7 +64,7 @@ services:
       - CONNECT_INTERNAL_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
       - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=false
       - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
-    depends_on: [redpanda, db]
+    depends_on: [redpanda, db, schema-registry]
 
   prometheus:
     image: prom/prometheus:latest

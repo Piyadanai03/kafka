@@ -1,0 +1,31 @@
+{
+    "name": "jdbc-sink-payments-approved",
+    "config": {
+        "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+        "tasks.max": "1",
+        "topics": "payments.approved",
+        "table.name.format": "payments_approved",
+
+        "connection.url": "jdbc:postgresql://db:5432/order_db",
+        "connection.username": "postgres",
+        "connection.password": "postgres",
+
+        "auto.create": "true",
+        "auto.evolve": "true",
+        "schema.evolution": "basic",
+
+        "insert.mode": "upsert",
+        "primary.key.mode": "record_value",
+        "primary.key.fields": "orderId",
+        "delete.enabled": "false",
+
+        "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+        "value.converter": "io.confluent.connect.avro.AvroConverter",
+        "value.converter.schema.registry.url": "http://schema-registry:8080/apis/ccompat/v7",
+        "value.converter.subject.name.strategy": "io.confluent.kafka.serializers.subject.RecordNameStrategy",
+
+        "errors.tolerance": "all",
+        "errors.log.enable": "true",
+        "errors.log.include.messages": "true"
+    }
+}
