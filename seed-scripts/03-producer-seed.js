@@ -22,7 +22,7 @@ const run = async () => {
 
   console.log('Sending 100 random orders...');
 
-  for (let i = 1; i <= 100; i++) {
+  for (let i = 1; i <= 20; i++) {
     const orderId = `ORD-2025-${i.toString().padStart(4, '0')}`;
     const sku = getRandomSku();
     
@@ -47,7 +47,7 @@ const run = async () => {
     if (i % 10 === 0) console.log(`Sent ${i} orders...`);
   }
 
-  console.log('All 100 orders sent!');
+  console.log('All 20 orders sent!');
   await producer.disconnect();
 };
 

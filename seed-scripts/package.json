@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "node 01-create-topic.js && node 04-create-app-topics.js && node 05-seed-stock.js && node 06-create-payment-topics.js && node 07-create-analytics-topics.js",
+    "dev": "node 01-create-topic.js && node 04-create-app-topics.js && node 05-seed-stock.js && node 06-create-payment-topics.js && node 07-create-analytics-topics.js && node 08-create-parking-lot.js",
     "comsumer": "node 02-consumer.js"
 
   },

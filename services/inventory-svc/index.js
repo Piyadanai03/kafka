@@ -68,7 +68,6 @@ redisClient.on("error", (err) =>
     })
   )
 );
-// <<< END ADD >>>
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 class OutOfStockError extends Error {
@@ -190,7 +189,7 @@ const processOrders = async () => {
 
   await orderConsumer.connect();
   await orderConsumer.subscribe({
-    topic: "orders.created"
+    topic: "orders.created",
   });
   await producer.connect();
 
@@ -222,7 +221,6 @@ const processOrders = async () => {
 
       // จำลองหน่วงเวลาในการประมวลผล
       await sleep(2000);
-
 
       const order = JSON.parse(message.value.toString());
       const { orderId, sku, quantity, traceId } = order;
@@ -264,7 +262,7 @@ const processOrders = async () => {
         ]);
         return;
       }
-      const MAX_RETRIES = 3;
+      const MAX_RETRIES = 1;
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
           const currentStock = stock.get(sku) || 0;
@@ -273,7 +271,7 @@ const processOrders = async () => {
               `Not enough stock for ${sku}: ${currentStock} < ${quantity}`
             );
           }
-          if (Math.random() < 0.1 && attempt < MAX_RETRIES) {
+          if (Math.random() < 0.1) {
             throw new Error("Simulated transient database error!");
           }
 
@@ -341,11 +339,35 @@ const processOrders = async () => {
           if (attempt === MAX_RETRIES) {
             console.error(
               JSON.stringify({
-                /* ... */ message: "[DLQ] Max retries reached. Sending to DLQ.",
+                level: "ERROR",
+                traceId,
+                orderId,
+                service: SERVICE_NAME,
+                message: "[DLQ] Max retries reached. Sending to DLQ.",
                 error: error.message,
               })
-            ); // ... producer.send to DLQ ...
-            // processedOrderIds.add(orderId); // <<< REMOVED
+            );
+
+            // 1. สร้าง Payload สำหรับ DLQ
+            const dlqPayload = {
+              originalTopic: topic,
+              originalPayloadString: message.value.toString(), // Message เดิม (ที่เป็น String)
+              error: error.message,
+              service: SERVICE_NAME,
+              timestamp: new Date().toISOString(),
+            };
+
+            // 2. ส่งไปที่ DLQ
+            await producer.send({
+              topic: "inventory.dlq",
+              messages: [
+                {
+                  // เราใช้ orderId เป็น key เพื่อให้ Message ที่มาจากออเดอร์เดียวกันไปที่ Partition เดียวกัน
+                  key: orderId,
+                  value: JSON.stringify(dlqPayload),
+                },
+              ],
+            }); // 3. Commit Offset (สำคัญมาก!) เพื่อบอกว่าเราจัดการ Message นี้แล้ว
             await orderConsumer.commitOffsets([
               { topic, partition, offset: message.offset },
             ]);
