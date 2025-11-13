@@ -219,13 +219,18 @@ const processOrders = async () => {
         ]);
         return; // 3. ข้ามไปทำงาน Message ถัดไป
       }
+
+      // จำลองหน่วงเวลาในการประมวลผล
       await sleep(2000);
+
+
       const order = JSON.parse(message.value.toString());
       const { orderId, sku, quantity, traceId } = order;
 
       console.log(
         JSON.stringify({
           level: "INFO",
+          partition,
           traceId,
           orderId,
           service: SERVICE_NAME,
